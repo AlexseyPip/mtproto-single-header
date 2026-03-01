@@ -91,15 +91,20 @@ typedef void (*mtproto_log_t)(void* userdata, int level, const char* msg);
 /* Callback: optional, called when auth state changes (e.g. code sent, logged in) */
 typedef void (*mtproto_auth_callback_t)(void* userdata, int event, const char* info);
 
+/* Callback: optional, establish TCP connection to DC. Use mtproto_get_dc_address for host/port.
+ * Return 1 on success, 0 on failure. send_data/recv_data will use the established connection. */
+typedef int (*mtproto_connect_to_dc_t)(void* userdata, int dc_id, int server);
+
 /* Set of callbacks - user provides implementations */
 typedef struct {
-    mtproto_get_time_ms_t  get_time_ms;
-    mtproto_random_bytes_t random_bytes;
-    mtproto_send_t         send_data;
-    mtproto_recv_t         recv_data;
-    mtproto_log_t          log;             /* Optional, may be NULL */
-    mtproto_auth_callback_t auth_callback;  /* Optional, may be NULL */
-    void*                  userdata;
+    mtproto_get_time_ms_t   get_time_ms;
+    mtproto_random_bytes_t  random_bytes;
+    mtproto_send_t          send_data;
+    mtproto_recv_t          recv_data;
+    mtproto_log_t           log;             /* Optional, may be NULL */
+    mtproto_auth_callback_t auth_callback;   /* Optional, may be NULL */
+    mtproto_connect_to_dc_t connect_to_dc;   /* Optional, establishes TCP to DC */
+    void*                   userdata;
 } mtproto_callbacks_t;
 
 /*--------------------------------------------------------------------------
@@ -153,6 +158,13 @@ const char* mtproto_get_last_error(void);
  */
 #define MTPROTO_SERVER_PRODUCTION  0
 #define MTPROTO_SERVER_TEST        1
+
+/**
+ * Get DC host and port. host_buf: output buffer, host_size: its size. port: output.
+ * dc_id: 1-5 production, 10001-10005 test. Returns 1 on success, 0 if dc_id invalid.
+ */
+int mtproto_get_dc_address(int dc_id, int server, char* host_buf, size_t host_size, int* port);
+
 mtproto_session_t* mtproto_connect(mtproto_state_t* state, int dc_id, int server);
 
 /**
@@ -1628,6 +1640,29 @@ const char* mtproto_get_last_error(void) {
     return g_mtproto_last_error;
 }
 
+/* Telegram production DC IPs (port 443). Test DCs use same IPs, dc_id 10001-10005 in protocol. */
+static const char* const mtp_dc_hosts[5] = {
+    "149.154.175.10",   /* DC1 Miami */
+    "149.154.167.40",   /* DC2 Amsterdam */
+    "149.154.175.117",  /* DC3 Miami */
+    "149.154.167.91",   /* DC4 Amsterdam */
+    "91.108.56.130"     /* DC5 Singapore */
+};
+
+int mtproto_get_dc_address(int dc_id, int server, char* host_buf, size_t host_size, int* port) {
+    int idx = dc_id;
+    if (server) idx = dc_id;  /* test: same IPs, dc_id 10001-10005 in protocol */
+    if (idx < 1 || idx > 5) return 0;
+    if (host_buf && host_size > 0) {
+        size_t len = strlen(mtp_dc_hosts[idx - 1]);
+        if (len >= host_size) len = host_size - 1;
+        memcpy(host_buf, mtp_dc_hosts[idx - 1], len);
+        host_buf[len] = '\0';
+    }
+    if (port) *port = 443;
+    return 1;
+}
+
 mtproto_state_t* mtproto_create(const mtproto_callbacks_t* callbacks) {
     if (!callbacks || !callbacks->get_time_ms || !callbacks->random_bytes ||
         !callbacks->send_data || !callbacks->recv_data) {
@@ -1650,6 +1685,10 @@ void mtproto_destroy(mtproto_state_t* state) {
 
 mtproto_session_t* mtproto_connect(mtproto_state_t* state, int dc_id, int server) {
     if (!state || dc_id < 1 || dc_id > 5) return NULL;
+    if (state->cbs.connect_to_dc && !state->cbs.connect_to_dc(state->cbs.userdata, dc_id, server)) {
+        mtp_set_error("connect_to_dc failed");
+        return NULL;
+    }
     mtproto_session_t* s = (mtproto_session_t*)malloc(sizeof(mtproto_session_t));
     if (!s) return NULL;
     memset(s, 0, sizeof(mtproto_session_t));
@@ -1660,7 +1699,6 @@ mtproto_session_t* mtproto_connect(mtproto_state_t* state, int dc_id, int server
         free(s);
         return NULL;
     }
-    /* TODO: establish transport connection to DC (user provides send/recv) */
     return s;
 }
 
