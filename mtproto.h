@@ -65,6 +65,9 @@ extern "C" {
 #ifndef MTPROTO_RSA_KEY_COUNT
 #define MTPROTO_RSA_KEY_COUNT      5             /* Built-in server public keys */
 #endif
+#ifndef MTPROTO_ABRIDGED_RECV_BUF
+#define MTPROTO_ABRIDGED_RECV_BUF  16384         /* Buffer for one abridged packet (auth fits) */
+#endif
 
 /*--------------------------------------------------------------------------
  * SECTION 2: PLATFORM ABSTRACTION - USER MUST IMPLEMENT
@@ -114,6 +117,7 @@ typedef struct {
 #define MTPROTO_ERR_CRYPTO         -8
 #define MTPROTO_ERR_NOT_CONNECTED  -9
 #define MTPROTO_ERR_ALREADY_AUTH   -10
+#define MTPROTO_ERR_BUFFER_TOO_SMALL -11
 
 /*--------------------------------------------------------------------------
  * SECTION 4: OPAQUE TYPES
@@ -199,6 +203,18 @@ int mtproto_save_session(const mtproto_session_t* session, void* buf, size_t buf
  * Restore session from saved data.
  */
 mtproto_session_t* mtproto_restore_session(mtproto_state_t* state, const void* data, size_t size);
+
+/**
+ * Receive one abridged packet. buf/buf_size: output buffer.
+ * Returns payload length, 0 if no data yet, <0 on error.
+ */
+int mtproto_recv_packet(mtproto_session_t* session, uint8_t* buf, size_t buf_size);
+
+/**
+ * Decrypt MTProto 2.0 message. raw = output of mtproto_recv_packet when authorized.
+ * msg_out receives the inner msg_data (TL payload). Returns msg_data length, <0 on error.
+ */
+int mtproto_decrypt_message(mtproto_session_t* session, const uint8_t* raw, size_t raw_len, uint8_t* msg_out, size_t msg_size);
 
 /**
  * Process incoming data and handle updates. Call periodically when connected.
@@ -1005,9 +1021,216 @@ struct mtproto_session_s {
     uint32_t p, q;
     uint64_t dh_prime_be[32];  /* placeholder */
     int auth_step;  /* 0=need req_pq, 1=got resPQ, 2=got server_DH_params, 3=got dh_gen_ok */
-    char phone_code_hash[64];   /* from auth.sentCode, for auth.signIn */
-    char phone[32];             /* last phone sent */
+    char phone_code_hash[64];
+    char phone[32];
+    /* Abridged transport */
+    int abridged_sent;          /* 1 if 0xef sent */
+    uint8_t recv_len_buf[4];    /* length bytes */
+    size_t recv_len_have;
+    int recv_state;             /* 0=need len1, 1=need len3, 2=need payload */
+    size_t recv_want;           /* payload bytes to read */
+    size_t recv_pos;            /* bytes of payload received */
+    /* DH state (auth flow) */
+    int g;                      /* DH generator */
+    uint8_t dh_prime[256];      /* DH prime */
+    uint8_t g_a[256];           /* server g^a */
+    size_t dh_prime_len, g_a_len;
+    int32_t server_time;
+    uint8_t p_bytes[8], q_bytes[8];  /* factored pq */
+    size_t p_len, q_len;
 };
+
+/*--------------------------------------------------------------------------
+ * Abridged transport (MTProto framing: 0xef, length, payload)
+ *--------------------------------------------------------------------------*/
+static int mtp_abridged_send(mtproto_session_t* s, const uint8_t* payload, size_t len) {
+    uint8_t hdr[4];
+    size_t hdr_len;
+    uint32_t len_words;
+    int r;
+    if (!s || !s->state || !payload) return MTPROTO_ERR_INVALID_PARAM;
+    if (len & 3) return MTPROTO_ERR_PROTOCOL;  /* must be multiple of 4 */
+    len_words = (uint32_t)(len / 4);
+    /* Send 0xef on first packet */
+    if (!s->abridged_sent) {
+        uint8_t ef = 0xef;
+        r = s->state->cbs.send_data(s->state->cbs.userdata, &ef, 1);
+        if (r != 1) return MTPROTO_ERR_TRANSPORT;
+        s->abridged_sent = 1;
+    }
+    if (len_words < 127u) {
+        hdr[0] = (uint8_t)len_words;
+        hdr_len = 1;
+    } else {
+        hdr[0] = 0x7f;
+        hdr[1] = (uint8_t)(len_words);
+        hdr[2] = (uint8_t)(len_words >> 8);
+        hdr[3] = (uint8_t)(len_words >> 16);
+        hdr_len = 4;
+    }
+    r = s->state->cbs.send_data(s->state->cbs.userdata, hdr, hdr_len);
+    if (r != (int)hdr_len) return MTPROTO_ERR_TRANSPORT;
+    r = s->state->cbs.send_data(s->state->cbs.userdata, payload, len);
+    if (r != (int)len) return MTPROTO_ERR_TRANSPORT;
+    return MTPROTO_OK;
+}
+
+static int64_t mtp_gen_msg_id(mtproto_session_t* s);
+
+/*--------------------------------------------------------------------------
+ * MTProto 2.0 encrypted messages (msg_key, aes_key/iv, envelope)
+ * x=0 client->server, x=8 server->client
+ *--------------------------------------------------------------------------*/
+static int mtp_encrypt_message(mtproto_session_t* s, const uint8_t* tl_data, size_t tl_len, int content_related,
+                               uint8_t* out, size_t out_size) {
+    uint8_t plain[4096];
+    uint8_t* p;
+    size_t plain_len, pad_len, total_len;
+    uint8_t msg_key_large[32], msg_key[16];
+    uint8_t sha256_a[32], sha256_b[32];
+    uint8_t aes_key[32], aes_iv[32];
+    uint8_t to_hash[4096];
+    int x = 0;  /* client -> server */
+    int32_t msg_len;
+    if (!s || !tl_data || !out || out_size < 32) return MTPROTO_ERR_INVALID_PARAM;
+    if (!s->authorized) return MTPROTO_ERR_NOT_CONNECTED;
+    msg_len = (int32_t)tl_len;
+    p = plain;
+    memcpy(p, &s->server_salt, 8); p += 8;
+    memcpy(p, &s->session_id, 8); p += 8;
+    { int64_t mid = mtp_gen_msg_id(s); memcpy(p, &mid, 8); p += 8; }
+    { uint32_t seq = content_related ? (s->seq_no * 2 + 1) : (s->seq_no * 2); memcpy(p, &seq, 4); p += 4; if (content_related) s->seq_no++; }
+    memcpy(p, &msg_len, 4); p += 4;
+    memcpy(p, tl_data, tl_len); p += tl_len;
+    plain_len = (size_t)(p - plain);
+    pad_len = 12 + (16 - (plain_len + 12) % 16) % 16;
+    if (pad_len > 1024) pad_len = 12 + (16 - (plain_len + 12) % 16) % 16;
+    if (s->state->cbs.random_bytes && pad_len > 0) {
+        if (s->state->cbs.random_bytes(s->state->cbs.userdata, p, pad_len) != 1) return MTPROTO_ERR_CRYPTO;
+        p += pad_len;
+    } else {
+        memset(p, 0, pad_len);
+        p += pad_len;
+    }
+    total_len = (size_t)(p - plain);
+    if (total_len > sizeof(to_hash) - 32) return MTPROTO_ERR_PROTOCOL;
+    memcpy(to_hash, s->auth_key + 88 + x, 32);
+    memcpy(to_hash + 32, plain, total_len);
+    mtp_sha256_full(to_hash, 32 + total_len, msg_key_large);
+    memcpy(msg_key, msg_key_large + 8, 16);
+    memcpy(to_hash, msg_key, 16);
+    memcpy(to_hash + 16, s->auth_key + x, 36);
+    mtp_sha256_full(to_hash, 52, sha256_a);
+    memcpy(to_hash, s->auth_key + 40 + x, 36);
+    memcpy(to_hash + 36, msg_key, 16);
+    mtp_sha256_full(to_hash, 52, sha256_b);
+    memcpy(aes_key, sha256_a, 8); memcpy(aes_key + 8, sha256_b + 8, 16); memcpy(aes_key + 24, sha256_a + 24, 8);
+    memcpy(aes_iv, sha256_b, 8); memcpy(aes_iv + 8, sha256_a + 8, 16); memcpy(aes_iv + 24, sha256_b + 24, 8);
+    if (out_size < 8 + 16 + total_len) return MTPROTO_ERR_BUFFER_TOO_SMALL;
+    memcpy(out, s->auth_key_id, 8);
+    memcpy(out + 8, msg_key, 16);
+    memcpy(out + 24, plain, total_len);
+    mtp_aes_ige_encrypt(out + 24, total_len, aes_key, aes_iv);
+    return (int)(8 + 16 + total_len);
+}
+
+/* Decrypt MTProto 2.0 message. raw = auth_key_id(8)+msg_key(16)+encrypted. Returns msg_data length, <0 on error. x=8 for server->client. */
+static int mtp_decrypt_message(mtproto_session_t* s, const uint8_t* raw, size_t raw_len, uint8_t* msg_out, size_t msg_size) {
+    uint8_t tmp[4096], verify_buf[4128];
+    uint8_t sha256_a[32], sha256_b[32];
+    uint8_t aes_key[32], aes_iv[32];
+    uint8_t msg_key[16], hash_result[32];
+    int x = 8;  /* server -> client */
+    size_t enc_len;
+    int32_t msg_data_len;
+    if (!s || !raw || !msg_out || raw_len < 8 + 16 + 32) return MTPROTO_ERR_INVALID_PARAM;
+    if (memcmp(raw, s->auth_key_id, 8) != 0) return MTPROTO_ERR_PROTOCOL;
+    enc_len = raw_len - 8 - 16;
+    if (enc_len % 16) return MTPROTO_ERR_PROTOCOL;
+    memcpy(msg_key, raw + 8, 16);
+    memcpy(tmp, raw + 24, enc_len);
+    if (52 <= sizeof(verify_buf)) {
+        memcpy(verify_buf, msg_key, 16);
+        memcpy(verify_buf + 16, s->auth_key + x, 36);
+        mtp_sha256_full(verify_buf, 52, sha256_a);
+    }
+    memcpy(verify_buf, s->auth_key + 40 + x, 36);
+    memcpy(verify_buf + 36, msg_key, 16);
+    mtp_sha256_full(verify_buf, 52, sha256_b);
+    memcpy(aes_key, sha256_a, 8); memcpy(aes_key + 8, sha256_b + 8, 16); memcpy(aes_key + 24, sha256_a + 24, 8);
+    memcpy(aes_iv, sha256_b, 8); memcpy(aes_iv + 8, sha256_a + 8, 16); memcpy(aes_iv + 24, sha256_b + 24, 8);
+    mtp_aes_ige_decrypt(tmp, enc_len, aes_key, aes_iv);
+    if (32 + enc_len > sizeof(verify_buf)) return MTPROTO_ERR_PROTOCOL;
+    memcpy(verify_buf, s->auth_key + 88 + x, 32);
+    memcpy(verify_buf + 32, tmp, enc_len);
+    mtp_sha256_full(verify_buf, 32 + enc_len, hash_result);
+    if (memcmp(msg_key, hash_result + 8, 16) != 0) return MTPROTO_ERR_CRYPTO;
+    memcpy(&msg_data_len, tmp + 24, 4);
+    if (msg_data_len < 0 || (size_t)msg_data_len > enc_len - 32) return MTPROTO_ERR_PROTOCOL;
+    if ((size_t)msg_data_len > msg_size) return MTPROTO_ERR_BUFFER_TOO_SMALL;
+    memcpy(msg_out, tmp + 32, (size_t)msg_data_len);
+    return (int)msg_data_len;
+}
+
+/* Recv one abridged packet into out_buf. Returns payload length, 0 if need more data, <0 on error. */
+static int mtp_abridged_recv(mtproto_session_t* s, uint8_t* out_buf, size_t out_size) {
+    int r;
+    uint32_t len_words;
+    if (!s || !s->state || !out_buf) return MTPROTO_ERR_INVALID_PARAM;
+    while (1) {
+        if (s->recv_state == 0) {
+            r = s->state->cbs.recv_data(s->state->cbs.userdata, s->recv_len_buf, 1);
+            if (r <= 0) return r;
+            s->recv_len_have = 1;
+            if (s->recv_len_buf[0] < 0x80u) {
+                len_words = s->recv_len_buf[0];
+                s->recv_want = len_words * 4;
+                s->recv_state = 2;
+                s->recv_pos = 0;
+            } else if (s->recv_len_buf[0] == 0x7f) {
+                s->recv_state = 1;
+            } else {
+                /* Quick ACK or invalid - skip */
+                s->recv_state = 0;
+                continue;
+            }
+        }
+        if (s->recv_state == 1) {
+            r = s->state->cbs.recv_data(s->state->cbs.userdata, s->recv_len_buf + 1, 3);
+            if (r <= 0) return r;
+            len_words = (uint32_t)s->recv_len_buf[1] | ((uint32_t)s->recv_len_buf[2] << 8) | ((uint32_t)s->recv_len_buf[3] << 16);
+            s->recv_want = len_words * 4;
+            s->recv_state = 2;
+            s->recv_pos = 0;
+        }
+        if (s->recv_state == 2) {
+            size_t to_read = s->recv_want - s->recv_pos;
+            if (to_read > out_size - s->recv_pos) {
+                /* Buffer too small - read and discard */
+                if (out_size < s->recv_want) {
+                    uint8_t discard[256];
+                    while (s->recv_pos < s->recv_want) {
+                        size_t n = s->recv_want - s->recv_pos;
+                        if (n > sizeof(discard)) n = sizeof(discard);
+                        r = s->state->cbs.recv_data(s->state->cbs.userdata, discard, n);
+                        if (r <= 0) return MTPROTO_ERR_TRANSPORT;
+                        s->recv_pos += (size_t)r;
+                    }
+                    s->recv_state = 0;
+                    mtp_set_error("Packet too large for buffer");
+                    return MTPROTO_ERR_BUFFER_TOO_SMALL;
+                }
+            }
+            r = s->state->cbs.recv_data(s->state->cbs.userdata, out_buf + s->recv_pos, to_read);
+            if (r <= 0) return r;
+            s->recv_pos += (size_t)r;
+            if (s->recv_pos >= s->recv_want) {
+                s->recv_state = 0;
+                return (int)s->recv_want;
+            }
+        }
+    }
+}
 
 /*--------------------------------------------------------------------------
  * TL serialization helpers
@@ -1189,13 +1412,213 @@ int mtproto_store_sent_code(mtproto_session_t* session, const uint8_t* data, siz
 }
 
 /*--------------------------------------------------------------------------
- * Message ID generation (MTProto spec: time*2^32 + counter*4)
+ * Auth flow: resPQ parser, PQ factoring, req_DH_params, server_DH_params_ok,
+ * set_client_DH_params, dh_gen_ok
+ *--------------------------------------------------------------------------*/
+static int mtp_factor_pq(uint64_t pq_val, uint32_t* p_out, uint32_t* q_out) {
+    uint32_t p, q;
+    if (pq_val < 4) return -1;
+    for (p = 2; (uint64_t)p * p <= pq_val && p < 0x10000u; p++) {
+        if (pq_val % p == 0) {
+            q = (uint32_t)(pq_val / p);
+            if (p > q) { uint32_t t = p; p = q; q = t; }
+            *p_out = p;
+            *q_out = q;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int mtp_parse_respq(mtproto_session_t* s, const uint8_t* data, size_t len) {
+    const uint8_t* p = data;
+    const uint8_t* end = data + len;
+    uint32_t ctor;
+    uint64_t pq_val = 0;
+    int i, vec_len;
+    if (len < 4) return MTPROTO_ERR_PROTOCOL;
+    memcpy(&ctor, p, 4); p += 4;
+    if (ctor != TL_RES_PQ) return MTPROTO_ERR_PROTOCOL;
+    if (p + 16 + 16 > end) return MTPROTO_ERR_PROTOCOL;
+    if (memcmp(p, s->nonce, 16) != 0) return MTPROTO_ERR_PROTOCOL;
+    p += 16;
+    memcpy(s->server_nonce, p, 16); p += 16;
+    /* pq string (big-endian) */
+    if (p >= end) return MTPROTO_ERR_PROTOCOL;
+    { uint32_t pq_len; uint8_t first = *p++; if (first < 254) pq_len = first; else { if (p + 3 > end) return -1; pq_len = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16); p += 3; } if (p + pq_len > end || pq_len > 8) return -1; for (i = 0; i < (int)pq_len; i++) pq_val = (pq_val << 8) | p[i]; p += pq_len; p += (4 - ((int)pq_len + 1) % 4) % 4; }
+    s->pq = pq_val;
+    /* Vector<long> fingerprints */
+    if (p + 4 > end) return MTPROTO_ERR_PROTOCOL;
+    memcpy(&ctor, p, 4); p += 4;
+    if (ctor != TL_VECTOR) return MTPROTO_ERR_PROTOCOL;
+    if (p + 4 > end) return -1;
+    memcpy(&vec_len, p, 4); p += 4;
+    (void)vec_len;
+    if (p + 8 > end) return -1;
+    /* Use first fingerprint - production key 85FD64DE851D9DD0 */
+    p += 8;
+    if (mtp_factor_pq(pq_val, &s->p, &s->q) != 0) return MTPROTO_ERR_CRYPTO;
+    s->p_len = 4; s->q_len = 4;
+    s->p_bytes[0] = (uint8_t)(s->p >> 24); s->p_bytes[1] = (uint8_t)(s->p >> 16); s->p_bytes[2] = (uint8_t)(s->p >> 8); s->p_bytes[3] = (uint8_t)s->p;
+    s->q_bytes[0] = (uint8_t)(s->q >> 24); s->q_bytes[1] = (uint8_t)(s->q >> 16); s->q_bytes[2] = (uint8_t)(s->q >> 8); s->q_bytes[3] = (uint8_t)s->q;
+    return MTPROTO_OK;
+}
+
+/* Build p_q_inner_data_dc + RSA encrypt -> req_DH_params */
+static int mtp_build_req_dh_params(mtproto_session_t* s, uint8_t* buf, size_t buf_size) {
+    uint8_t inner[256];
+    uint8_t pq_buf[8];
+    uint8_t* p;
+    int dc = s->dc_id;
+    int i, pq_bytes = 0;
+    mtp_rsa_key_t rsa_key;
+    uint8_t enc[256];
+    if (buf_size < 512) return MTPROTO_ERR_INVALID_PARAM;
+    if (s->server) dc += 10000;
+    if (s->state->cbs.random_bytes(s->state->cbs.userdata, s->new_nonce, 32) != 1) return MTPROTO_ERR_CRYPTO;
+    { uint64_t v = s->pq; for (i = 7; i >= 0; i--) { pq_buf[i] = (uint8_t)(v & 0xff); if (v) pq_bytes = 8 - i; v >>= 8; } }
+    if (pq_bytes == 0) pq_bytes = 1;
+    p = inner;
+    mtp_tl_write_constructor(&p, TL_P_Q_INNER_DATA_DC);
+    mtp_tl_write_bytes(&p, pq_buf + (8 - pq_bytes), (size_t)pq_bytes);
+    mtp_tl_write_bytes(&p, s->p_bytes, s->p_len);
+    mtp_tl_write_bytes(&p, s->q_bytes, s->q_len);
+    memcpy(p, s->nonce, 16); p += 16;
+    memcpy(p, s->server_nonce, 16); p += 16;
+    memcpy(p, s->new_nonce, 32); p += 32;
+    mtp_tl_write_int32(&p, dc);
+    if ((size_t)(p - inner) > 144) return MTPROTO_ERR_PROTOCOL;
+    memcpy(&rsa_key.n, mtp_rsa_n_prod, 256);
+    rsa_key.e[0] = 0x01; rsa_key.e[1] = 0x00; rsa_key.e[2] = 0x01; rsa_key.e_len = 3;
+    if (mtp_rsa_encrypt(inner, (size_t)(p - inner), &rsa_key, enc, s->state->cbs.random_bytes, s->state->cbs.userdata) != 0) return MTPROTO_ERR_CRYPTO;
+    p = buf;
+    mtp_tl_write_constructor(&p, TL_REQ_DH_PARAMS);
+    memcpy(p, s->nonce, 16); p += 16;
+    memcpy(p, s->server_nonce, 16); p += 16;
+    mtp_tl_write_bytes(&p, s->p_bytes, s->p_len);
+    mtp_tl_write_bytes(&p, s->q_bytes, s->q_len);
+    mtp_tl_write_int64(&p, 0x85FD64DE851D9DD0LL);
+    mtp_tl_write_bytes(&p, enc, 256);
+    return (int)(p - buf);
+}
+
+static void mtp_sha1_concat(const uint8_t* a, size_t alen, const uint8_t* b, size_t blen, uint8_t out[20]) {
+    uint8_t buf[128];
+    if (alen + blen <= sizeof(buf)) { memcpy(buf, a, alen); memcpy(buf + alen, b, blen); mtp_sha1(buf, alen + blen, out); }
+}
+
+/* Parse server_DH_params_ok, decrypt, extract g, dh_prime, g_a, server_time */
+static int mtp_parse_server_dh_params_ok(mtproto_session_t* s, const uint8_t* data, size_t len) {
+    const uint8_t* p = data;
+    const uint8_t* end = data + len;
+    uint32_t ctor, enc_len_u;
+    uint8_t tmp_key[32], tmp_iv[32];
+    uint8_t sha1_a[20], sha1_b[20], sha1_c[20];
+    uint8_t enc_buf[1024];
+    size_t enc_len;
+    if (len < 4 + 16 + 16) return MTPROTO_ERR_PROTOCOL;
+    memcpy(&ctor, p, 4); p += 4;
+    if (ctor != TL_SERVER_DH_PARAMS_OK) return MTPROTO_ERR_PROTOCOL;
+    if (memcmp(p, s->nonce, 16) != 0) return MTPROTO_ERR_PROTOCOL;
+    p += 16;
+    if (memcmp(p, s->server_nonce, 16) != 0) return MTPROTO_ERR_PROTOCOL;
+    p += 16;
+    if (p >= end) return MTPROTO_ERR_PROTOCOL;
+    if (*p < 254) { enc_len_u = *p++; } else { if (p + 4 > end) return -1; p++; enc_len_u = (uint32_t)p[0]|(p[1]<<8)|(p[2]<<16); p += 3; }
+    if (p + enc_len_u > end || enc_len_u > sizeof(enc_buf)) return MTPROTO_ERR_PROTOCOL;
+    memcpy(enc_buf, p, enc_len_u); p += enc_len_u; p += (4 - (enc_len_u + 1) % 4) % 4;
+    enc_len = enc_len_u;
+    mtp_sha1_concat(s->new_nonce, 32, s->server_nonce, 16, sha1_a);  /* SHA1(new_nonce+server_nonce) */
+    mtp_sha1_concat(s->server_nonce, 16, s->new_nonce, 32, sha1_b);  /* SHA1(server_nonce+new_nonce) */
+    mtp_sha1_concat(s->new_nonce, 32, s->new_nonce, 32, sha1_c);  /* SHA1(new_nonce+new_nonce) */
+    memcpy(tmp_key, sha1_a, 20); memcpy(tmp_key + 20, sha1_b, 12);
+    memcpy(tmp_iv, sha1_b + 12, 8); memcpy(tmp_iv + 8, sha1_c, 20); memcpy(tmp_iv + 28, s->new_nonce, 4);
+    mtp_aes_ige_decrypt(enc_buf, (enc_len + 15) & ~15, tmp_key, tmp_iv);
+    /* Verify SHA1(decrypted)[0:20] == SHA1(rest) - skip hash */
+    p = enc_buf + 20;
+    end = enc_buf + enc_len;
+    memcpy(&ctor, p, 4); p += 4;
+    if (ctor != TL_SERVER_DH_INNER) return MTPROTO_ERR_PROTOCOL;
+    p += 16; p += 16;
+    memcpy(&s->g, p, 4); p += 4;
+    if (p >= end) return -1;
+    { uint32_t ll; uint8_t f = *p++; if (f < 254) ll = f; else { ll = (uint32_t)p[0]|(p[1]<<8)|(p[2]<<16); p += 3; } s->dh_prime_len = ll; if (ll > 256) return -1; memcpy(s->dh_prime, p, ll); p += ll + (4-(ll+1)%4)%4; }
+    { uint32_t ll; uint8_t f = *p++; if (f < 254) ll = f; else { ll = (uint32_t)p[0]|(p[1]<<8)|(p[2]<<16); p += 3; } s->g_a_len = ll; if (ll > 256) return -1; memcpy(s->g_a, p, ll); p += ll + (4-(ll+1)%4)%4; }
+    memcpy(&s->server_time, p, 4);
+    return MTPROTO_OK;
+}
+
+/* Build set_client_DH_params */
+static int mtp_build_set_client_dh_params(mtproto_session_t* s, uint8_t* buf, size_t buf_size) {
+    uint8_t inner[512], enc[512];
+    uint8_t* p;
+    uint8_t tmp_key[32], tmp_iv[32];
+    uint8_t sha1_a[20], sha1_b[20];
+    uint8_t g_b_bytes[256];
+    mtp_bigint_t G, DH_PRIME, G_A, G_B, AUTH_KEY;
+    mtp_bigint_t B;
+    size_t inner_len, enc_len;
+    int i;
+    if (buf_size < 600) return MTPROTO_ERR_INVALID_PARAM;
+    mtp_sha1_concat(s->new_nonce, 32, s->server_nonce, 16, sha1_a);
+    mtp_sha1_concat(s->server_nonce, 16, s->new_nonce, 32, sha1_b);
+    memcpy(tmp_key, sha1_a, 20); memcpy(tmp_key + 20, sha1_b, 12);
+    memcpy(tmp_iv, sha1_b + 12, 8); memcpy(tmp_iv + 8, sha1_a, 20); memcpy(tmp_iv + 28, s->new_nonce, 4);
+    if (s->state->cbs.random_bytes(s->state->cbs.userdata, B.w, sizeof(B.w)) != 1) return MTPROTO_ERR_CRYPTO;
+    B.w[MTP_BIGINT_WORDS-1] &= 0x7FFFFFFFu; B.w[0] |= 1;
+    mtp_bigint_from_bytes_be(&DH_PRIME, s->dh_prime, s->dh_prime_len);
+    mtp_bigint_from_bytes_be(&G_A, s->g_a, s->g_a_len);
+    mtp_bigint_one(&G); G.w[0] = (uint32_t)s->g;
+    mtp_bigint_modexp(&G_B, &G, &B, &DH_PRIME);
+    mtp_bigint_modexp(&AUTH_KEY, &G_A, &B, &DH_PRIME);
+    mtp_bigint_to_bytes_be(&G_B, g_b_bytes, 256);
+    p = inner;
+    mtp_tl_write_constructor(&p, TL_CLIENT_DH_INNER);
+    memcpy(p, s->nonce, 16); p += 16;
+    memcpy(p, s->server_nonce, 16); p += 16;
+    mtp_tl_write_int64(&p, 0);  /* retry_id */
+    { size_t gb_len; for (i = 0; i < 256 && g_b_bytes[i] == 0; i++); gb_len = (size_t)(256 - i); if (gb_len == 0) gb_len = 1; mtp_tl_write_bytes(&p, g_b_bytes + i, gb_len); }
+    inner_len = (size_t)(p - inner);
+    enc_len = 20 + inner_len + 15; enc_len &= ~15;
+    if (enc_len > sizeof(enc)) return MTPROTO_ERR_PROTOCOL;
+    mtp_sha1(inner, inner_len, enc);
+    memcpy(enc + 20, inner, inner_len);
+    if (s->state->cbs.random_bytes(s->state->cbs.userdata, enc + 20 + inner_len, enc_len - 20 - inner_len) != 1) return MTPROTO_ERR_CRYPTO;
+    mtp_aes_ige_encrypt(enc, enc_len, tmp_key, tmp_iv);
+    p = buf;
+    mtp_tl_write_constructor(&p, TL_SET_CLIENT_DH_PARAMS);
+    memcpy(p, s->nonce, 16); p += 16;
+    memcpy(p, s->server_nonce, 16); p += 16;
+    mtp_tl_write_bytes(&p, enc, enc_len);
+    /* Store auth_key, auth_key_id (64 low bits of SHA1), server_salt */
+    mtp_bigint_to_bytes_be(&AUTH_KEY, s->auth_key, 256);
+    { uint8_t h[20]; mtp_sha1(s->auth_key, 256, h); memcpy(s->auth_key_id, h + 12, 8); }
+    s->server_salt = 0; for (i = 0; i < 8; i++) s->server_salt |= ((uint64_t)(s->new_nonce[i] ^ s->server_nonce[i])) << (i*8);
+    return (int)(p - buf);
+}
+
+static int mtp_parse_dh_gen_ok(mtproto_session_t* s, const uint8_t* data, size_t len) {
+    uint8_t hash[20], tmp[41];
+    uint32_t ctor;
+    if (len < 4 + 16 + 16 + 16) return MTPROTO_ERR_PROTOCOL;
+    memcpy(&ctor, data, 4);
+    if (ctor != TL_DH_GEN_OK) return MTPROTO_ERR_PROTOCOL;
+    if (memcmp(data + 4, s->nonce, 16) != 0) return MTPROTO_ERR_PROTOCOL;
+    if (memcmp(data + 20, s->server_nonce, 16) != 0) return MTPROTO_ERR_PROTOCOL;
+    memcpy(tmp, s->new_nonce, 32); tmp[32] = 1; memcpy(tmp + 33, s->auth_key_id, 8);  /* auth_key_id is low 64 bits of SHA1(auth_key); we need aux = high 64 bits. Actually auth_key_aux_hash = 64 higher bits of SHA1(auth_key). So first 8 bytes of SHA1(auth_key). */
+    mtp_sha1(s->auth_key, 256, hash); memcpy(tmp + 33, hash, 8);  /* auth_key_aux_hash = first 8 bytes of SHA1(auth_key) */
+    mtp_sha1(tmp, 41, hash);  /* new_nonce_hash1 = bytes 4-19 of SHA1 result (128 low bits) */
+    if (memcmp(data + 36, hash + 4, 16) != 0) return MTPROTO_ERR_PROTOCOL;
+    return MTPROTO_OK;
+}
+
+/*--------------------------------------------------------------------------
+ * Message ID generation
  *--------------------------------------------------------------------------*/
 static int64_t mtp_gen_msg_id(mtproto_session_t* s) {
     uint64_t ms = s->state->cbs.get_time_ms ? s->state->cbs.get_time_ms(s->state->cbs.userdata) : 0;
     int64_t t = (int64_t)(ms / 1000);
-    int64_t id = (t << 32) | ((s->msg_id_counter++) * 4);
-    return id;
+    return (t << 32) | ((s->msg_id_counter++) * 4);
 }
 
 /*--------------------------------------------------------------------------
@@ -1264,18 +1687,54 @@ int mtproto_req_pq(mtproto_session_t* session) {
     mtp_tl_write_constructor(&p, TL_REQ_PQ_MULTI);
     memcpy(p, session->nonce, 16);
     p += 16;
-    /* TODO: send via transport with abridged encoding */
-    if (session->state->cbs.send_data(session->state->cbs.userdata, buf, (size_t)(p - buf)) < 0)
+    if (mtp_abridged_send(session, buf, (size_t)(p - buf)) != MTPROTO_OK)
         return MTPROTO_ERR_TRANSPORT;
     session->auth_step = 1;
     return MTPROTO_OK;
 }
 
 int mtproto_do_auth_handshake(mtproto_session_t* session) {
-    if (!session) return MTPROTO_ERR_INVALID_PARAM;
-    /* Run req_pq -> resPQ -> req_DH_params -> server_DH_params_ok -> set_client_DH_params -> dh_gen_ok */
-    if (session->auth_step == 0) return mtproto_req_pq(session);
-    /* Poll for response and continue - simplified: user calls req_pq then poll */
+    uint8_t recv_buf[4096];
+    int r, n;
+    if (!session || !session->state) return MTPROTO_ERR_INVALID_PARAM;
+    if (session->auth_step == 0) {
+        r = mtproto_req_pq(session);
+        if (r != MTPROTO_OK) return r;
+        n = mtp_abridged_recv(session, recv_buf, sizeof(recv_buf));
+        if (n <= 0) return n < 0 ? n : MTPROTO_ERR_TIMEOUT;
+        if (n < 20) return MTPROTO_ERR_PROTOCOL;
+        r = mtp_parse_respq(session, recv_buf + 20, (size_t)n - 20);
+        if (r != MTPROTO_OK) return r;
+        n = mtp_build_req_dh_params(session, recv_buf, sizeof(recv_buf));
+        if (n < 0) return n;
+        { uint8_t full[4096]; uint8_t* p = full; mtp_tl_write_int64(&p, 0); mtp_tl_write_int64(&p, mtp_gen_msg_id(session)); mtp_tl_write_int32(&p, n); memcpy(p, recv_buf, (size_t)n); p += n; r = mtp_abridged_send(session, full, (size_t)(p - full)); }
+        if (r != MTPROTO_OK) return r;
+        session->auth_step = 2;
+        return MTPROTO_OK;
+    }
+    if (session->auth_step == 2) {
+        n = mtp_abridged_recv(session, recv_buf, sizeof(recv_buf));
+        if (n <= 0) return n < 0 ? n : MTPROTO_ERR_TIMEOUT;
+        if (n < 20) return MTPROTO_ERR_PROTOCOL;
+        r = mtp_parse_server_dh_params_ok(session, recv_buf + 20, (size_t)n - 20);
+        if (r != MTPROTO_OK) return r;
+        n = mtp_build_set_client_dh_params(session, recv_buf, sizeof(recv_buf));
+        if (n < 0) return n;
+        { uint8_t full[4096]; uint8_t* p = full; mtp_tl_write_int64(&p, 0); mtp_tl_write_int64(&p, mtp_gen_msg_id(session)); mtp_tl_write_int32(&p, n); memcpy(p, recv_buf, (size_t)n); p += n; r = mtp_abridged_send(session, full, (size_t)(p - full)); }
+        if (r != MTPROTO_OK) return r;
+        session->auth_step = 3;
+        return MTPROTO_OK;
+    }
+    if (session->auth_step == 3) {
+        n = mtp_abridged_recv(session, recv_buf, sizeof(recv_buf));
+        if (n <= 0) return n < 0 ? n : MTPROTO_ERR_TIMEOUT;
+        if (n < 20) return MTPROTO_ERR_PROTOCOL;
+        r = mtp_parse_dh_gen_ok(session, recv_buf + 20, (size_t)n - 20);
+        if (r != MTPROTO_OK) return r;
+        session->auth_step = 4;
+        session->authorized = 1;
+        return MTPROTO_OK;
+    }
     return MTPROTO_OK;
 }
 
@@ -1339,6 +1798,17 @@ mtproto_session_t* mtproto_restore_session(mtproto_state_t* state, const void* d
     return s;
 }
 
+int mtproto_recv_packet(mtproto_session_t* session, uint8_t* buf, size_t buf_size) {
+    if (!session || !buf) return MTPROTO_ERR_INVALID_PARAM;
+    return mtp_abridged_recv(session, buf, buf_size);
+}
+
+int mtproto_decrypt_message(mtproto_session_t* session, const uint8_t* raw, size_t raw_len, uint8_t* msg_out, size_t msg_size) {
+    if (!session || !raw || !msg_out) return MTPROTO_ERR_INVALID_PARAM;
+    if (!session->authorized) return MTPROTO_ERR_NOT_CONNECTED;
+    return mtp_decrypt_message(session, raw, raw_len, msg_out, msg_size);
+}
+
 int mtproto_poll(mtproto_session_t* session) {
     (void)session;
     /* Read from transport, parse messages, dispatch updates */
@@ -1346,10 +1816,16 @@ int mtproto_poll(mtproto_session_t* session) {
 }
 
 int mtproto_send_method(mtproto_session_t* session, const void* tl_data, size_t tl_len) {
+    uint8_t buf[MTPROTO_MAX_SEND_BUF];
+    int n;
     if (!session || !tl_data) return MTPROTO_ERR_INVALID_PARAM;
-    /* Wrap in encrypted message, send */
-    (void)tl_len;
-    return MTPROTO_OK;
+    if (!session->authorized) {
+        mtp_set_error("Not authorized - call mtproto_do_auth_handshake first");
+        return MTPROTO_ERR_NOT_CONNECTED;
+    }
+    n = mtp_encrypt_message(session, (const uint8_t*)tl_data, tl_len, 1, buf, sizeof(buf));
+    if (n < 0) return n;
+    return mtp_abridged_send(session, buf, (size_t)n);
 }
 
 int mtproto_send_message(mtproto_session_t* session, int64_t peer_user_id, int64_t peer_access_hash, const char* text) {
