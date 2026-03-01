@@ -66,7 +66,9 @@ mtproto_session_t* session = mtproto_connect(state, 2, MTPROTO_SERVER_PRODUCTION
 | req_pq, session save/restore | ✅ |
 | auth.sendCode, auth.signIn, messages.sendMessage (TL builders) | ✅ |
 | auth.sentCode, auth.authorization, rpc_error parsers | ✅ |
-| Auth flow (resPQ → dh_gen_ok), abridged transport, encrypted messages | ⏳ In progress |
+| Abridged transport (MTProto framing) | ✅ |
+| Full auth flow (req_pq → resPQ → req_DH_params → dh_gen_ok) | ✅ |
+| MTProto 2.0 encrypted messages (msg_key, envelope) | ✅ |
 
 ---
 
