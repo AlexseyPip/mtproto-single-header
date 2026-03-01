@@ -64,7 +64,9 @@ mtproto_session_t* session = mtproto_connect(state, 2, MTPROTO_SERVER_PRODUCTION
 | Big integer (2048-bit), RSA, DH | ✅ |
 | RSA encrypt (MTProto OAEP+), Telegram production key | ✅ |
 | req_pq, session save/restore | ✅ |
-| Auth flow, abridged transport, encrypted messages | ⏳ In progress |
+| auth.sendCode, auth.signIn, messages.sendMessage (TL builders) | ✅ |
+| auth.sentCode, auth.authorization, rpc_error parsers | ✅ |
+| Auth flow (resPQ → dh_gen_ok), abridged transport, encrypted messages | ⏳ In progress |
 
 ---
 
