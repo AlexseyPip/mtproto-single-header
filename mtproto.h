@@ -20,7 +20,9 @@
  *   mtproto_state_t* state = mtproto_create(&cbs);
  *   mtproto_session_t* session = mtproto_connect(state, 2, MTPROTO_SERVER_PRODUCTION);
  *   if (session) {
- *       mtproto_send_auth_code(session, "+1234567890");
+ *       mtproto_send_phone(session, "+1234567890", api_id, api_hash);
+ *       // after auth.sentCode: mtproto_store_sent_code(session, resp, len);
+ *       mtproto_send_auth_code(session, "12345");
  *       ...
  *   }
  *
@@ -173,12 +175,12 @@ int mtproto_req_pq(mtproto_session_t* session);
 int mtproto_do_auth_handshake(mtproto_session_t* session);
 
 /**
- * Send phone number for auth. Phone in international format: "+1234567890"
+ * Send phone number for auth. phone: "+1234567890", api_id/api_hash from my.telegram.org
  */
-int mtproto_send_phone(mtproto_session_t* session, const char* phone);
+int mtproto_send_phone(mtproto_session_t* session, const char* phone, int api_id, const char* api_hash);
 
 /**
- * Send authentication code received via Telegram.
+ * Send authentication code received via Telegram. Uses phone_code_hash from send_phone response.
  */
 int mtproto_send_auth_code(mtproto_session_t* session, const char* code);
 
@@ -211,10 +213,47 @@ int mtproto_poll(mtproto_session_t* session);
 int mtproto_send_method(mtproto_session_t* session, const void* tl_data, size_t tl_len);
 
 /**
- * Send text message to chat. Convenience wrapper around send_method.
- * chat_id: peer id (user or chat)
+ * Send text message to user. peer_user_id and peer_access_hash from contacts/dialogs.
+ * Use inputPeerSelf (user_id=0, access_hash=0) for "Saved Messages".
  */
-int mtproto_send_message(mtproto_session_t* session, int64_t chat_id, const char* text);
+int mtproto_send_message(mtproto_session_t* session, int64_t peer_user_id, int64_t peer_access_hash, const char* text);
+
+/**
+ * Build auth.sendCode TL into buf. Returns bytes written, or <0 on error.
+ */
+int mtproto_tl_build_auth_send_code(uint8_t* buf, size_t buf_size, const char* phone, int api_id, const char* api_hash);
+
+/**
+ * Build auth.signIn TL. Returns bytes written.
+ */
+int mtproto_tl_build_auth_sign_in(uint8_t* buf, size_t buf_size, const char* phone, const char* phone_code_hash, const char* code);
+
+/**
+ * Build messages.sendMessage TL. Use peer_user_id=0, peer_access_hash=0 for inputPeerSelf.
+ * random_id: unique per message (e.g. from session random or monotonic counter).
+ */
+int mtproto_tl_build_messages_send_message(uint8_t* buf, size_t buf_size, int64_t peer_user_id, int64_t peer_access_hash, const char* text, int64_t random_id);
+
+/**
+ * Parse auth.sentCode response, extract phone_code_hash into out (null-terminated). out_size includes null.
+ * Returns MTPROTO_OK on success.
+ */
+int mtproto_tl_parse_auth_sent_code(const uint8_t* data, size_t len, char* phone_code_hash_out, size_t out_size);
+
+/**
+ * Parse auth.sentCode and store phone_code_hash in session. Call after receiving auth.sendCode response.
+ */
+int mtproto_store_sent_code(mtproto_session_t* session, const uint8_t* data, size_t len);
+
+/**
+ * Parse auth.authorization - check if login successful. Returns 1 if ok, 0 if signUpRequired, -1 on error.
+ */
+int mtproto_tl_parse_auth_authorization(const uint8_t* data, size_t len);
+
+/**
+ * Parse rpc_error. Returns error code, or 0 if not an error. error_msg optional.
+ */
+int mtproto_tl_parse_rpc_error(const uint8_t* data, size_t len, char* error_msg_out, size_t msg_size);
 
 #ifdef MTPROTO_DEBUG
 /**
@@ -272,6 +311,16 @@ void mtproto_set_debug(mtproto_state_t* state, int enable);
 #define TL_SERVER_DH_INNER       0xb5890dbau
 #define TL_CLIENT_DH_INNER       0x6643b654u
 #define TL_VECTOR                0x1cb5c415u
+/* Auth TL constructors */
+#define TL_AUTH_SEND_CODE        0xa677244fu
+#define TL_AUTH_SIGN_IN          0x8d52a951u
+#define TL_CODE_SETTINGS         0xad253d78u
+#define TL_AUTH_SENT_CODE        0x5e002502u
+#define TL_AUTH_AUTHORIZATION    0x9a5c313eu
+#define TL_RPC_ERROR             0x2144ca19u
+#define TL_INPUT_PEER_SELF       0x7da07ec9u
+#define TL_INPUT_PEER_USER       0x7b8e7de6u
+#define TL_MESSAGES_SEND_MESSAGE 0x520c3870u  /* layer 46+ minimal: peer, message, random_id */
 #define TL_MSG_CONTAINER         0x73f1f8dcu
 #define TL_MSGS_ACK              0x62d6b459u
 #define TL_MSG_COPY              0xe06046b2u
@@ -956,6 +1005,8 @@ struct mtproto_session_s {
     uint32_t p, q;
     uint64_t dh_prime_be[32];  /* placeholder */
     int auth_step;  /* 0=need req_pq, 1=got resPQ, 2=got server_DH_params, 3=got dh_gen_ok */
+    char phone_code_hash[64];   /* from auth.sentCode, for auth.signIn */
+    char phone[32];             /* last phone sent */
 };
 
 /*--------------------------------------------------------------------------
@@ -988,6 +1039,153 @@ static void mtp_tl_write_bytes(uint8_t** p, const void* data, size_t len) {
 static void mtp_tl_write_constructor(uint8_t** p, uint32_t c) {
     memcpy(*p, &c, 4);
     *p += 4;
+}
+/* TL read primitives - *p advances, return value or <0 on overflow */
+static int mtp_tl_read_int32(const uint8_t** p, const uint8_t* end, int32_t* out) {
+    if (*p + 4 > end) return -1;
+    memcpy(out, *p, 4);
+    *p += 4;
+    return 0;
+}
+static int mtp_tl_read_int64(const uint8_t** p, const uint8_t* end, int64_t* out) {
+    if (*p + 8 > end) return -1;
+    memcpy(out, *p, 8);
+    *p += 8;
+    return 0;
+}
+/* Read TL string into buf (null-terminated), max buf_size. Returns bytes read from stream, or <0 on error. */
+static int mtp_tl_read_string(const uint8_t** p, const uint8_t* end, char* buf, size_t buf_size) {
+    if (*p >= end) return -1;
+    uint32_t len;
+    if (*(*p) < 254) {
+        len = *(*p)++;
+        if (*p + len > end) return -1;
+    } else {
+        if (*p + 4 > end) return -1;
+        (*p)++;
+        len = (uint32_t)(*p)[0] | ((uint32_t)(*p)[1] << 8) | ((uint32_t)(*p)[2] << 16);
+        *p += 3;
+        if (*p + len > end) return -1;
+    }
+    if (buf_size == 0) { *p += len + (4 - (len + 1) % 4) % 4; return (int)len; }
+    size_t copy = len < buf_size - 1 ? len : buf_size - 1;
+    memcpy(buf, *p, copy);
+    buf[copy] = '\0';
+    *p += len;
+    { int pad = (4 - (int)((len + 1) % 4)) % 4; if (*p + pad > end) return -1; *p += pad; }
+    return (int)len;
+}
+
+/*--------------------------------------------------------------------------
+ * TL method builders (standalone - for use with mtproto_send_method or direct send)
+ *--------------------------------------------------------------------------*/
+int mtproto_tl_build_auth_send_code(uint8_t* buf, size_t buf_size, const char* phone, int api_id, const char* api_hash) {
+    if (!buf || !phone || !api_hash) return -1;
+    size_t pl = strlen(phone), hl = strlen(api_hash);
+    size_t need = 4 + 4 + (pl < 254 ? 1 + pl : 4 + pl) + 4 + (hl < 254 ? 1 + hl : 4 + hl) + 4; /* constructor + phone + api_id + api_hash + codeSettings */
+    int p1 = (4 - ((int)pl + 1) % 4) % 4, p2 = (4 - ((int)hl + 1) % 4) % 4;
+    need += p1 + p2;
+    if (buf_size < need) return -1;
+    uint8_t* p = buf;
+    mtp_tl_write_constructor(&p, TL_AUTH_SEND_CODE);
+    mtp_tl_write_bytes(&p, phone, pl);
+    mtp_tl_write_int32(&p, api_id);
+    mtp_tl_write_bytes(&p, api_hash, hl);
+    mtp_tl_write_constructor(&p, TL_CODE_SETTINGS);
+    mtp_tl_write_int32(&p, 0);  /* flags=0 */
+    return (int)(p - buf);
+}
+
+int mtproto_tl_build_auth_sign_in(uint8_t* buf, size_t buf_size, const char* phone, const char* phone_code_hash, const char* code) {
+    if (!buf || !phone || !phone_code_hash || !code) return -1;
+    size_t pl = strlen(phone), hl = strlen(phone_code_hash), cl = strlen(code);
+    size_t need = 4 + (pl < 254 ? 1 + pl : 4 + pl) + (hl < 254 ? 1 + hl : 4 + hl) + (cl < 254 ? 1 + cl : 4 + cl);
+    need += (4 - ((int)pl + 1) % 4) % 4 + (4 - ((int)hl + 1) % 4) % 4 + (4 - ((int)cl + 1) % 4) % 4;
+    if (buf_size < need) return -1;
+    uint8_t* p = buf;
+    mtp_tl_write_constructor(&p, TL_AUTH_SIGN_IN);
+    mtp_tl_write_bytes(&p, phone, pl);
+    mtp_tl_write_bytes(&p, phone_code_hash, hl);
+    mtp_tl_write_bytes(&p, code, cl);
+    return (int)(p - buf);
+}
+
+int mtproto_tl_build_messages_send_message(uint8_t* buf, size_t buf_size, int64_t peer_user_id, int64_t peer_access_hash, const char* text, int64_t random_id) {
+    if (!buf || !text) return -1;
+    size_t tl = strlen(text);
+    size_t need = 4 + 4;  /* constructor + flags=0 */
+    if (peer_user_id == 0 && peer_access_hash == 0) {
+        need += 4;  /* inputPeerSelf */
+    } else {
+        need += 4 + 8 + 8;  /* inputPeerUser: constructor + user_id + access_hash */
+    }
+    need += (tl < 254 ? 1 + tl : 4 + tl) + (4 - ((int)tl + 1) % 4) % 4 + 8;  /* message + random_id */
+    if (buf_size < need) return -1;
+    uint8_t* p = buf;
+    mtp_tl_write_constructor(&p, TL_MESSAGES_SEND_MESSAGE);
+    mtp_tl_write_int32(&p, 0);  /* flags */
+    if (peer_user_id == 0 && peer_access_hash == 0) {
+        mtp_tl_write_constructor(&p, TL_INPUT_PEER_SELF);
+    } else {
+        mtp_tl_write_constructor(&p, TL_INPUT_PEER_USER);
+        mtp_tl_write_int64(&p, peer_user_id);
+        mtp_tl_write_int64(&p, peer_access_hash);
+    }
+    mtp_tl_write_bytes(&p, text, tl);
+    mtp_tl_write_int64(&p, random_id);
+    return (int)(p - buf);
+}
+
+/*--------------------------------------------------------------------------
+ * TL response parsers
+ *--------------------------------------------------------------------------*/
+int mtproto_tl_parse_auth_sent_code(const uint8_t* data, size_t len, char* phone_code_hash_out, size_t out_size) {
+    const uint8_t* p = data;
+    const uint8_t* end = data + len;
+    uint32_t ctor;
+    if (len < 4) return MTPROTO_ERR_PROTOCOL;
+    memcpy(&ctor, p, 4);
+    p += 4;
+    if (ctor != TL_AUTH_SENT_CODE) return MTPROTO_ERR_PROTOCOL;
+    if (p + 4 > end) return MTPROTO_ERR_PROTOCOL;
+    p += 4;  /* flags */
+    if (p + 4 > end) return MTPROTO_ERR_PROTOCOL;
+    { uint32_t type_ctor; memcpy(&type_ctor, p, 4); p += 4;
+      if (type_ctor == 0xc000bba2u || type_ctor == 0x3dbb5986u || type_ctor == 0x2c6b1e3bu) { if (p + 4 > end) return MTPROTO_ERR_PROTOCOL; p += 4; }
+      else if (type_ctor == 0x6f4f9243u) { if (mtp_tl_read_string(&p, end, (char*)0, 0) < 0) return MTPROTO_ERR_PROTOCOL; }  /* FlashCall: pattern string */
+    }
+    /* next is phone_code_hash string */
+    return mtp_tl_read_string(&p, end, phone_code_hash_out ? phone_code_hash_out : (char*)0, phone_code_hash_out ? out_size : 0) >= 0 ? MTPROTO_OK : MTPROTO_ERR_PROTOCOL;
+}
+
+int mtproto_tl_parse_auth_authorization(const uint8_t* data, size_t len) {
+    if (len < 4) return -1;
+    uint32_t ctor;
+    memcpy(&ctor, data, 4);
+    if (ctor == TL_AUTH_AUTHORIZATION) return 1;  /* auth.authorization - success */
+    if (ctor == 0x44747e9a) return 0;  /* auth.authorizationSignUpRequired */
+    return -1;
+}
+
+int mtproto_tl_parse_rpc_error(const uint8_t* data, size_t len, char* error_msg_out, size_t msg_size) {
+    const uint8_t* p = data;
+    const uint8_t* end = data + len;
+    uint32_t ctor;
+    int32_t code;
+    if (len < 4) return 0;
+    memcpy(&ctor, p, 4);
+    if (ctor != TL_RPC_ERROR) return 0;
+    p += 4;
+    if (p + 4 > end) return 0;
+    memcpy(&code, p, 4);
+    p += 4;
+    if (mtp_tl_read_string(&p, end, error_msg_out ? error_msg_out : (char*)0, error_msg_out ? msg_size : 0) < 0) return 0;
+    return (int)code;
+}
+
+int mtproto_store_sent_code(mtproto_session_t* session, const uint8_t* data, size_t len) {
+    if (!session) return MTPROTO_ERR_INVALID_PARAM;
+    return mtproto_tl_parse_auth_sent_code(data, len, session->phone_code_hash, sizeof(session->phone_code_hash));
 }
 
 /*--------------------------------------------------------------------------
@@ -1081,18 +1279,27 @@ int mtproto_do_auth_handshake(mtproto_session_t* session) {
     return MTPROTO_OK;
 }
 
-int mtproto_send_phone(mtproto_session_t* session, const char* phone) {
-    (void)session;
-    (void)phone;
-    /* TL: auth.sendCode, then user receives code */
-    return MTPROTO_OK;
+int mtproto_send_phone(mtproto_session_t* session, const char* phone, int api_id, const char* api_hash) {
+    uint8_t buf[MTPROTO_MAX_SEND_BUF];
+    int n;
+    if (!session || !phone || !api_hash) return MTPROTO_ERR_INVALID_PARAM;
+    n = mtproto_tl_build_auth_send_code(buf, sizeof(buf), phone, api_id, api_hash);
+    if (n < 0) return MTPROTO_ERR_GENERIC;
+    if ((size_t)snprintf(session->phone, sizeof(session->phone), "%s", phone) >= sizeof(session->phone)) session->phone[sizeof(session->phone)-1] = '\0';
+    return mtproto_send_method(session, buf, (size_t)n);
 }
 
 int mtproto_send_auth_code(mtproto_session_t* session, const char* code) {
-    (void)session;
-    (void)code;
-    /* TL: auth.signIn */
-    return MTPROTO_OK;
+    uint8_t buf[MTPROTO_MAX_SEND_BUF];
+    int n;
+    if (!session || !code) return MTPROTO_ERR_INVALID_PARAM;
+    if (!session->phone_code_hash[0]) {
+        mtp_set_error("phone_code_hash not set - call mtproto_store_sent_code after send_phone response");
+        return MTPROTO_ERR_INVALID_PARAM;
+    }
+    n = mtproto_tl_build_auth_sign_in(buf, sizeof(buf), session->phone, session->phone_code_hash, code);
+    if (n < 0) return MTPROTO_ERR_GENERIC;
+    return mtproto_send_method(session, buf, (size_t)n);
 }
 
 int mtproto_send_password(mtproto_session_t* session, const char* password) {
@@ -1145,11 +1352,15 @@ int mtproto_send_method(mtproto_session_t* session, const void* tl_data, size_t 
     return MTPROTO_OK;
 }
 
-int mtproto_send_message(mtproto_session_t* session, int64_t chat_id, const char* text) {
+int mtproto_send_message(mtproto_session_t* session, int64_t peer_user_id, int64_t peer_access_hash, const char* text) {
+    uint8_t buf[MTPROTO_MAX_SEND_BUF];
+    int n;
+    int64_t random_id;
     if (!session || !text) return MTPROTO_ERR_INVALID_PARAM;
-    /* Build messages.sendMessage TL, call send_method */
-    (void)chat_id;
-    return MTPROTO_OK;
+    random_id = mtp_gen_msg_id(session);
+    n = mtproto_tl_build_messages_send_message(buf, sizeof(buf), peer_user_id, peer_access_hash, text, random_id);
+    if (n < 0) return MTPROTO_ERR_GENERIC;
+    return mtproto_send_method(session, buf, (size_t)n);
 }
 
 #ifdef MTPROTO_DEBUG
