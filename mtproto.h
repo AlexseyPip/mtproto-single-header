@@ -1954,7 +1954,7 @@ int mtproto_recv_packet(mtproto_session_t* session, uint8_t* buf, size_t buf_siz
 int mtproto_decrypt_message(mtproto_session_t* session, const uint8_t* raw, size_t raw_len, uint8_t* msg_out, size_t msg_size) {
     if (!session || !raw || !msg_out) return MTPROTO_ERR_INVALID_PARAM;
     if (!session->authorized) return MTPROTO_ERR_NOT_CONNECTED;
-    return mtp_decrypt_message(session, raw, raw_len, msg_out, msg_size);
+    return mtp_decrypt_message(session, raw, raw_len, msg_out, msg_size, NULL);
 }
 
 int mtproto_poll(mtproto_session_t* session, uint8_t* msg_out, size_t msg_size) {
