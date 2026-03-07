@@ -1957,18 +1957,55 @@ int mtproto_decrypt_message(mtproto_session_t* session, const uint8_t* raw, size
     return mtp_decrypt_message(session, raw, raw_len, msg_out, msg_size, NULL);
 }
 
+/* Helper: process one TL message (body), return 1 if handled, 0 if pass-through. Used by poll and msg_container iteration. */
+static int mtp_poll_dispatch_one(mtproto_session_t* session, const uint8_t* body, size_t body_len, uint8_t* msg_out, size_t msg_size, int* out_len) {
+    const uint8_t* p = body;
+    const uint8_t* end = body + body_len;
+    uint32_t ctor;
+    if (body_len < 4) return 0;
+    memcpy(&ctor, p, 4); p += 4;
+    if (ctor == TL_RPC_RESULT && (size_t)(end - p) >= 8) { p += 8; if ((size_t)(end - p) < 4) return 0; memcpy(&ctor, p, 4); p += 4; }
+    if (ctor == TL_BAD_SERVER_SALT) { if (mtproto_handle_bad_server_salt(session, body, body_len)) { *out_len = MTPROTO_ERR_RETRY_SALT; return 1; } }
+    if (ctor == TL_AUTH_SENT_CODE) {
+        mtproto_store_sent_code(session, body, body_len);
+        if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_CODE_SENT, "auth.sentCode");
+        return 1;
+    }
+    if (ctor == TL_AUTH_AUTHORIZATION) {
+        if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_LOGGED_IN, NULL);
+        return 1;
+    }
+    if (ctor == 0x44747e9au) {
+        if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_FAILED, "signUpRequired");
+        return 1;
+    }
+    if (ctor == TL_RPC_ERROR) {
+        char err[128]; int code = mtproto_tl_parse_rpc_error(body, body_len, err, sizeof(err));
+        if (code == 401 || code == 400) {
+            if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_PASSWORD_NEEDED, err);
+        } else {
+            if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_FAILED, err);
+        }
+        return 1;
+    }
+    if (ctor == TL_MSGS_ACK) { (void)session; return 1; }  /* server ack, ignore */
+    *out_len = (int)body_len;
+    return 0;  /* pass-through */
+}
+
 int mtproto_poll(mtproto_session_t* session, uint8_t* msg_out, size_t msg_size) {
     uint8_t raw[MTPROTO_MAX_RECV_BUF];
     uint8_t dec[MTPROTO_MAX_RECV_BUF];
-    int n, len;
+    int n, len, disp_len = 0;
     const uint8_t* p;
     const uint8_t* end;
     uint32_t ctor;
+    int64_t recv_msg_id;
     if (!session || !session->state) return MTPROTO_ERR_INVALID_PARAM;
     n = mtp_abridged_recv(session, raw, sizeof(raw));
     if (n <= 0) return n < 0 ? n : MTPROTO_ERR_TIMEOUT;
-    if (!session->authorized) return MTPROTO_OK;  /* Pre-auth: raw unencrypted, don't handle here */
-    len = mtp_decrypt_message(session, raw, (size_t)n, dec, sizeof(dec));
+    if (!session->authorized) return MTPROTO_OK;
+    len = mtp_decrypt_message(session, raw, (size_t)n, dec, sizeof(dec), &recv_msg_id);
     if (len < 0) return len;
     p = dec; end = dec + len;
     if ((size_t)(end - p) < 4) return MTPROTO_OK;
