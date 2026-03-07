@@ -26,6 +26,8 @@ int      recv_data(void* ud, void* buf, size_t n);      /* Raw byte stream */
 
 User owns: TCP/socket, TLS (if used), `/dev/urandom` or HW RNG, RTC or `time()`. The library only sends/receives bytes.
 
+Optional `connect_to_dc` callback: the library calls it before creating a session. Use `mtproto_get_dc_address(dc_id, server, host, host_size, &port)` to get DC host/port, then establish TCP and wire `send_data`/`recv_data` to that socket. See `examples/platform_linux.c` for POSIX.
+
 ---
 
 ## Usage
@@ -63,12 +65,16 @@ mtproto_session_t* session = mtproto_connect(state, 2, MTPROTO_SERVER_PRODUCTION
 | AES-256 encrypt/decrypt, IGE mode | ✅ |
 | Big integer (2048-bit), RSA, DH | ✅ |
 | RSA encrypt (MTProto OAEP+), Telegram production key | ✅ |
-| req_pq, session save/restore | ✅ |
+| req_pq, session save/restore (dc_id persisted) | ✅ |
 | auth.sendCode, auth.signIn, messages.sendMessage (TL builders) | ✅ |
+| initConnection + invokeWithLayer wrapper (first API call) | ✅ |
 | auth.sentCode, auth.authorization, rpc_error parsers | ✅ |
+| bad_server_salt handler, dh_gen_retry / dh_gen_fail | ✅ |
 | Abridged transport (MTProto framing) | ✅ |
 | Full auth flow (req_pq → resPQ → req_DH_params → dh_gen_ok) | ✅ |
 | MTProto 2.0 encrypted messages (msg_key, envelope) | ✅ |
+| mtproto_poll (recv → decrypt → auth callbacks) | ✅ |
+| MTPROTO_CUSTOM_ALLOC (optional malloc/free) | ✅ |
 
 ---
 
@@ -88,6 +94,27 @@ examples/       — minimal client, echo bot, platform stubs
 ```bash
 gcc -std=c99 -DMTPROTO_IMPLEMENTATION -I. your_app.c -o your_app
 ```
+
+---
+
+## API Reference (selected)
+
+| Function | Description |
+|----------|-------------|
+| `mtproto_create` | Create state with callbacks |
+| `mtproto_connect` | Create session for DC (1–5), connect TCP via callback |
+| `mtproto_do_auth_handshake` | Run DH auth (req_pq → dh_gen_ok) |
+| `mtproto_send_phone` | Send phone, initConnection-wrapped |
+| `mtproto_send_auth_code` | Sign in with SMS code |
+| `mtproto_send_method` | Send arbitrary TL method (encrypted) |
+| `mtproto_poll` | Recv one packet, decrypt, handle auth/service, optional app msg output |
+| `mtproto_handle_bad_server_salt` | Update salt and retry on bad_server_salt |
+| `mtproto_save_session` | Save auth_key, server_salt, dc_id |
+| `mtproto_restore_session` | Restore from saved blob |
+
+**Error codes:** `MTPROTO_ERR_RETRY_SALT` — bad_server_salt handled, retry last request.
+
+**Optional:** Define `MTPROTO_MALLOC`/`MTPROTO_FREE` before including for custom allocator.
 
 ---
 
