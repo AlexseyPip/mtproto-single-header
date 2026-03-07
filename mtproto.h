@@ -68,6 +68,12 @@ extern "C" {
 #ifndef MTPROTO_ABRIDGED_RECV_BUF
 #define MTPROTO_ABRIDGED_RECV_BUF  16384         /* Buffer for one abridged packet (auth fits) */
 #endif
+#ifndef MTPROTO_MALLOC
+#define MTPROTO_MALLOC(sz)    malloc(sz)
+#endif
+#ifndef MTPROTO_FREE
+#define MTPROTO_FREE(p)       free(p)
+#endif
 
 /*--------------------------------------------------------------------------
  * SECTION 2: PLATFORM ABSTRACTION - USER MUST IMPLEMENT
@@ -123,6 +129,7 @@ typedef struct {
 #define MTPROTO_ERR_NOT_CONNECTED  -9
 #define MTPROTO_ERR_ALREADY_AUTH   -10
 #define MTPROTO_ERR_BUFFER_TOO_SMALL -11
+#define MTPROTO_ERR_RETRY_SALT    -12  /* bad_server_salt handled, retry last request */
 
 /*--------------------------------------------------------------------------
  * SECTION 4: OPAQUE TYPES
@@ -229,10 +236,13 @@ int mtproto_recv_packet(mtproto_session_t* session, uint8_t* buf, size_t buf_siz
 int mtproto_decrypt_message(mtproto_session_t* session, const uint8_t* raw, size_t raw_len, uint8_t* msg_out, size_t msg_size);
 
 /**
- * Process incoming data and handle updates. Call periodically when connected.
- * Returns MTPROTO_OK, MTPROTO_ERR_* on error.
+ * Process one incoming packet: recv, decrypt, handle auth/service messages.
+ * If auth.sentCode/auth.authorization/rpc_error: handles internally, invokes auth_callback.
+ * If bad_server_salt: updates salt, returns MTPROTO_ERR_RETRY_SALT (retry last request).
+ * If app message: copy to msg_out, return length. msg_out can be NULL to discard.
+ * Returns: >0 = app message length, 0 = handled, MTPROTO_ERR_RETRY_SALT = retry, <0 = error.
  */
-int mtproto_poll(mtproto_session_t* session);
+int mtproto_poll(mtproto_session_t* session, uint8_t* msg_out, size_t msg_size);
 
 /**
  * Send a TL method. tl_data: serialized TL method (constructor + params).
@@ -250,6 +260,13 @@ int mtproto_send_message(mtproto_session_t* session, int64_t peer_user_id, int64
  * Build auth.sendCode TL into buf. Returns bytes written, or <0 on error.
  */
 int mtproto_tl_build_auth_send_code(uint8_t* buf, size_t buf_size, const char* phone, int api_id, const char* api_hash);
+
+/**
+ * Build invokeWithLayer(initConnection(auth.sendCode(...))). Use for first API call.
+ * device_model/system_version/app_version/lang_* can be NULL for defaults.
+ */
+int mtproto_tl_build_auth_send_code_wrapped(uint8_t* buf, size_t buf_size, const char* phone, int api_id, const char* api_hash,
+    const char* device_model, const char* system_version, const char* app_version, const char* lang_code);
 
 /**
  * Build auth.signIn TL. Returns bytes written.
@@ -282,6 +299,11 @@ int mtproto_tl_parse_auth_authorization(const uint8_t* data, size_t len);
  * Parse rpc_error. Returns error code, or 0 if not an error. error_msg optional.
  */
 int mtproto_tl_parse_rpc_error(const uint8_t* data, size_t len, char* error_msg_out, size_t msg_size);
+
+/**
+ * Handle bad_server_salt: if data is that TL type, update session server_salt. Returns 1 if handled (retry last request), 0 if not.
+ */
+int mtproto_handle_bad_server_salt(mtproto_session_t* session, const uint8_t* data, size_t len);
 
 #ifdef MTPROTO_DEBUG
 /**
@@ -353,6 +375,13 @@ void mtproto_set_debug(mtproto_state_t* state, int enable);
 #define TL_MSGS_ACK              0x62d6b459u
 #define TL_MSG_COPY              0xe06046b2u
 #define TL_GZIP_PACKED           0x3072cfa1u
+#define TL_BAD_MSG_NOTIFICATION  0xa7eff811u
+#define TL_BAD_SERVER_SALT       0xedab447bu
+#define TL_INIT_CONNECTION       0xc1cd5ea9u
+#define TL_INVOKE_WITH_LAYER     0xda9b0d0du
+#define TL_ACCOUNT_GET_PASSWORD  0x548a30f5u
+#define TL_AUTH_CHECK_PASSWORD   0xd18b4d16u
+#define TL_RPC_RESULT            0xf35c6d01u
 
 /* Auth callback events */
 #define MTP_AUTH_EVENT_CODE_SENT     1
@@ -1331,6 +1360,41 @@ int mtproto_tl_build_auth_send_code(uint8_t* buf, size_t buf_size, const char* p
     return (int)(p - buf);
 }
 
+int mtproto_tl_build_auth_send_code_wrapped(uint8_t* buf, size_t buf_size, const char* phone, int api_id, const char* api_hash,
+    const char* device_model, const char* system_version, const char* app_version, const char* lang_code) {
+    uint8_t inner[512];
+    int n;
+    const char* dm = device_model ? device_model : "mtproto";
+    const char* sv = system_version ? system_version : "1.0";
+    const char* av = app_version ? app_version : "1.0";
+    const char* lc = lang_code ? lang_code : "en";
+    n = mtproto_tl_build_auth_send_code(inner, sizeof(inner), phone, api_id, api_hash);
+    if (n < 0) return -1;
+    /* initConnection: flags=0, api_id, device_model, system_version, app_version, system_lang_code, lang_pack, lang_code, query */
+    { uint8_t ic[768]; uint8_t* q = ic; size_t dml = strlen(dm), svl = strlen(sv), avl = strlen(av), lcl = strlen(lc);
+      if (sizeof(ic) < 4+4+(dml<254?1+dml:4+dml)+(svl<254?1+svl:4+svl)+(avl<254?1+avl:4+avl)+(lcl<254?1+lcl:4+lcl)*2 + (size_t)n + 64) return -1;
+      mtp_tl_write_constructor(&q, TL_INIT_CONNECTION);
+      mtp_tl_write_int32(&q, 0);  /* flags */
+      mtp_tl_write_int32(&q, api_id);
+      mtp_tl_write_bytes(&q, dm, dml);
+      mtp_tl_write_bytes(&q, sv, svl);
+      mtp_tl_write_bytes(&q, av, avl);
+      mtp_tl_write_bytes(&q, lc, lcl);
+      mtp_tl_write_bytes(&q, "mtproto", 7);
+      mtp_tl_write_bytes(&q, lc, lcl);
+      memcpy(q, inner, (size_t)n); q += n;
+      { uint8_t iwl[1024]; uint8_t* r = iwl; int ic_len = (int)(q - ic);
+        if (ic_len + 8 > (int)sizeof(iwl)) return -1;
+        mtp_tl_write_constructor(&r, TL_INVOKE_WITH_LAYER);
+        mtp_tl_write_int32(&r, 176);  /* layer */
+        memcpy(r, ic, (size_t)ic_len); r += ic_len;
+        if (buf_size < (size_t)(r - iwl)) return -1;
+        memcpy(buf, iwl, (size_t)(r - iwl));
+        return (int)(r - iwl);
+      }
+    }
+}
+
 int mtproto_tl_build_auth_sign_in(uint8_t* buf, size_t buf_size, const char* phone, const char* phone_code_hash, const char* code) {
     if (!buf || !phone || !phone_code_hash || !code) return -1;
     size_t pl = strlen(phone), hl = strlen(phone_code_hash), cl = strlen(code);
@@ -1421,6 +1485,15 @@ int mtproto_tl_parse_rpc_error(const uint8_t* data, size_t len, char* error_msg_
 int mtproto_store_sent_code(mtproto_session_t* session, const uint8_t* data, size_t len) {
     if (!session) return MTPROTO_ERR_INVALID_PARAM;
     return mtproto_tl_parse_auth_sent_code(data, len, session->phone_code_hash, sizeof(session->phone_code_hash));
+}
+
+int mtproto_handle_bad_server_salt(mtproto_session_t* session, const uint8_t* data, size_t len) {
+    uint32_t ctor;
+    if (!session || !data || len < 4 + 8 + 4 + 4 + 8) return 0;
+    memcpy(&ctor, data, 4);
+    if (ctor != TL_BAD_SERVER_SALT) return 0;
+    memcpy(&session->server_salt, data + 20, 8);
+    return 1;
 }
 
 /*--------------------------------------------------------------------------
@@ -1609,11 +1682,20 @@ static int mtp_build_set_client_dh_params(mtproto_session_t* s, uint8_t* buf, si
     return (int)(p - buf);
 }
 
-static int mtp_parse_dh_gen_ok(mtproto_session_t* s, const uint8_t* data, size_t len) {
+/* Parse dh_gen response. Returns: MTPROTO_OK=dh_gen_ok, MTPROTO_ERR_RETRY_SALT=dh_gen_retry (retry set_client_dh), <0=fail */
+static int mtp_parse_dh_gen_response(mtproto_session_t* s, const uint8_t* data, size_t len) {
     uint8_t hash[20], tmp[41];
     uint32_t ctor;
-    if (len < 4 + 16 + 16 + 16) return MTPROTO_ERR_PROTOCOL;
+    if (len < 4) return MTPROTO_ERR_PROTOCOL;
     memcpy(&ctor, data, 4);
+    if (ctor == TL_DH_GEN_RETRY) {
+        /* Retry with same nonces - re-send set_client_DH_params */
+        return MTPROTO_ERR_RETRY_SALT;  /* reuse for retry signal */
+    }
+    if (ctor == TL_DH_GEN_FAIL) {
+        mtp_set_error("DH auth failed (dh_gen_fail)");
+        return MTPROTO_ERR_AUTH_FAILED;
+    }
     if (ctor != TL_DH_GEN_OK) return MTPROTO_ERR_PROTOCOL;
     if (memcmp(data + 4, s->nonce, 16) != 0) return MTPROTO_ERR_PROTOCOL;
     if (memcmp(data + 20, s->server_nonce, 16) != 0) return MTPROTO_ERR_PROTOCOL;
@@ -1669,7 +1751,7 @@ mtproto_state_t* mtproto_create(const mtproto_callbacks_t* callbacks) {
         mtp_set_error("Invalid callbacks");
         return NULL;
     }
-    mtproto_state_t* s = (mtproto_state_t*)malloc(sizeof(mtproto_state_t));
+    mtproto_state_t* s = (mtproto_state_t*)MTPROTO_MALLOC(sizeof(mtproto_state_t));
     if (!s) {
         mtp_set_error("Out of memory");
         return NULL;
@@ -1680,7 +1762,7 @@ mtproto_state_t* mtproto_create(const mtproto_callbacks_t* callbacks) {
 }
 
 void mtproto_destroy(mtproto_state_t* state) {
-    if (state) free(state);
+    if (state) MTPROTO_FREE(state);
 }
 
 mtproto_session_t* mtproto_connect(mtproto_state_t* state, int dc_id, int server) {
@@ -1689,14 +1771,14 @@ mtproto_session_t* mtproto_connect(mtproto_state_t* state, int dc_id, int server
         mtp_set_error("connect_to_dc failed");
         return NULL;
     }
-    mtproto_session_t* s = (mtproto_session_t*)malloc(sizeof(mtproto_session_t));
+    mtproto_session_t* s = (mtproto_session_t*)MTPROTO_MALLOC(sizeof(mtproto_session_t));
     if (!s) return NULL;
     memset(s, 0, sizeof(mtproto_session_t));
     s->state = state;
     s->dc_id = dc_id;
     s->server = server;
     if (state->cbs.random_bytes(state->cbs.userdata, &s->session_id, 8) != 1) {
-        free(s);
+        MTPROTO_FREE(s);
         return NULL;
     }
     return s;
@@ -1705,7 +1787,7 @@ mtproto_session_t* mtproto_connect(mtproto_state_t* state, int dc_id, int server
 void mtproto_disconnect(mtproto_session_t* session) {
     if (session) {
         memset(session->auth_key, 0, sizeof(session->auth_key));
-        free(session);
+        MTPROTO_FREE(session);
     }
 }
 
@@ -1764,11 +1846,22 @@ int mtproto_do_auth_handshake(mtproto_session_t* session) {
         return MTPROTO_OK;
     }
     if (session->auth_step == 3) {
-        n = mtp_abridged_recv(session, recv_buf, sizeof(recv_buf));
-        if (n <= 0) return n < 0 ? n : MTPROTO_ERR_TIMEOUT;
-        if (n < 20) return MTPROTO_ERR_PROTOCOL;
-        r = mtp_parse_dh_gen_ok(session, recv_buf + 20, (size_t)n - 20);
-        if (r != MTPROTO_OK) return r;
+        for (;;) {
+            n = mtp_abridged_recv(session, recv_buf, sizeof(recv_buf));
+            if (n <= 0) return n < 0 ? n : MTPROTO_ERR_TIMEOUT;
+            if (n < 20) return MTPROTO_ERR_PROTOCOL;
+            r = mtp_parse_dh_gen_response(session, recv_buf + 20, (size_t)n - 20);
+            if (r == MTPROTO_ERR_RETRY_SALT) {
+                /* dh_gen_retry: re-send set_client_DH_params */
+                n = mtp_build_set_client_dh_params(session, recv_buf, sizeof(recv_buf));
+                if (n < 0) return n;
+                { uint8_t full[4096]; uint8_t* p = full; mtp_tl_write_int64(&p, 0); mtp_tl_write_int64(&p, mtp_gen_msg_id(session)); mtp_tl_write_int32(&p, n); memcpy(p, recv_buf, (size_t)n); p += n; r = mtp_abridged_send(session, full, (size_t)(p - full)); }
+                if (r != MTPROTO_OK) return r;
+                continue;
+            }
+            if (r != MTPROTO_OK) return r;
+            break;
+        }
         session->auth_step = 4;
         session->authorized = 1;
         return MTPROTO_OK;
@@ -1780,7 +1873,7 @@ int mtproto_send_phone(mtproto_session_t* session, const char* phone, int api_id
     uint8_t buf[MTPROTO_MAX_SEND_BUF];
     int n;
     if (!session || !phone || !api_hash) return MTPROTO_ERR_INVALID_PARAM;
-    n = mtproto_tl_build_auth_send_code(buf, sizeof(buf), phone, api_id, api_hash);
+    n = mtproto_tl_build_auth_send_code_wrapped(buf, sizeof(buf), phone, api_id, api_hash, NULL, NULL, NULL, NULL);
     if (n < 0) return MTPROTO_ERR_GENERIC;
     if ((size_t)snprintf(session->phone, sizeof(session->phone), "%s", phone) >= sizeof(session->phone)) session->phone[sizeof(session->phone)-1] = '\0';
     return mtproto_send_method(session, buf, (size_t)n);
@@ -1802,13 +1895,13 @@ int mtproto_send_auth_code(mtproto_session_t* session, const char* code) {
 int mtproto_send_password(mtproto_session_t* session, const char* password) {
     (void)session;
     (void)password;
-    /* TL: account.password + auth.checkPassword */
-    return MTPROTO_OK;
+    mtp_set_error("2FA password (SRP) not yet implemented - use account.getPassword + auth.checkPassword manually");
+    return MTPROTO_ERR_GENERIC;
 }
 
 int mtproto_save_session(const mtproto_session_t* session, void* buf, size_t buf_size) {
     if (!session) return MTPROTO_ERR_INVALID_PARAM;
-    size_t need = 8 + 8 + MTP_AUTH_KEY_SIZE + 8 + 4;
+    size_t need = 8 + 8 + MTP_AUTH_KEY_SIZE + 8 + 4 + 4 + 4;
     if (!buf) return (int)need;
     if (buf_size < need) return MTPROTO_ERR_INVALID_PARAM;
     uint8_t* p = (uint8_t*)buf;
@@ -1816,13 +1909,16 @@ int mtproto_save_session(const mtproto_session_t* session, void* buf, size_t buf
     memcpy(p, &session->server_salt, 8); p += 8;
     memcpy(p, session->auth_key, MTP_AUTH_KEY_SIZE); p += MTP_AUTH_KEY_SIZE;
     memcpy(p, session->auth_key_id, 8); p += 8;
-    memcpy(p, &session->seq_no, 4);
+    memcpy(p, &session->seq_no, 4); p += 4;
+    memcpy(p, &session->dc_id, 4); p += 4;
+    memcpy(p, &session->server, 4);
     return (int)need;
 }
 
 mtproto_session_t* mtproto_restore_session(mtproto_state_t* state, const void* data, size_t size) {
-    if (!state || !data || size < 8+8+MTP_AUTH_KEY_SIZE+8+4) return NULL;
-    mtproto_session_t* s = (mtproto_session_t*)malloc(sizeof(mtproto_session_t));
+    size_t min_size = 8 + 8 + MTP_AUTH_KEY_SIZE + 8 + 4;
+    if (!state || !data || size < min_size) return NULL;
+    mtproto_session_t* s = (mtproto_session_t*)MTPROTO_MALLOC(sizeof(mtproto_session_t));
     if (!s) return NULL;
     memset(s, 0, sizeof(mtproto_session_t));
     s->state = state;
@@ -1831,7 +1927,13 @@ mtproto_session_t* mtproto_restore_session(mtproto_state_t* state, const void* d
     memcpy(&s->server_salt, p, 8); p += 8;
     memcpy(s->auth_key, p, MTP_AUTH_KEY_SIZE); p += MTP_AUTH_KEY_SIZE;
     memcpy(s->auth_key_id, p, 8); p += 8;
-    memcpy(&s->seq_no, p, 4);
+    memcpy(&s->seq_no, p, 4); p += 4;
+    if (size >= min_size + 8) {
+        memcpy(&s->dc_id, p, 4); p += 4;
+        memcpy(&s->server, p, 4);
+    } else {
+        s->dc_id = 2; s->server = 0;  /* defaults if old format */
+    }
     s->authorized = 1;
     return s;
 }
@@ -1847,9 +1949,60 @@ int mtproto_decrypt_message(mtproto_session_t* session, const uint8_t* raw, size
     return mtp_decrypt_message(session, raw, raw_len, msg_out, msg_size);
 }
 
-int mtproto_poll(mtproto_session_t* session) {
-    (void)session;
-    /* Read from transport, parse messages, dispatch updates */
+int mtproto_poll(mtproto_session_t* session, uint8_t* msg_out, size_t msg_size) {
+    uint8_t raw[MTPROTO_MAX_RECV_BUF];
+    uint8_t dec[MTPROTO_MAX_RECV_BUF];
+    int n, len;
+    const uint8_t* p;
+    const uint8_t* end;
+    uint32_t ctor;
+    if (!session || !session->state) return MTPROTO_ERR_INVALID_PARAM;
+    n = mtp_abridged_recv(session, raw, sizeof(raw));
+    if (n <= 0) return n < 0 ? n : MTPROTO_ERR_TIMEOUT;
+    if (!session->authorized) return MTPROTO_OK;  /* Pre-auth: raw unencrypted, don't handle here */
+    len = mtp_decrypt_message(session, raw, (size_t)n, dec, sizeof(dec));
+    if (len < 0) return len;
+    p = dec; end = dec + len;
+    if ((size_t)(end - p) < 4) return MTPROTO_OK;
+    memcpy(&ctor, p, 4); p += 4;
+    if (ctor == TL_RPC_RESULT && (size_t)(end - p) >= 8) {
+        p += 8;  /* skip req_msg_id */
+        if ((size_t)(end - p) < 4) return MTPROTO_OK;
+        memcpy(&ctor, p, 4); p += 4;
+    }
+    if (ctor == TL_BAD_SERVER_SALT) {
+        if (mtproto_handle_bad_server_salt(session, dec, (size_t)len)) return MTPROTO_ERR_RETRY_SALT;
+    }
+    if (ctor == TL_AUTH_SENT_CODE) {
+        mtproto_store_sent_code(session, p - 4, (size_t)(end - p + 4));
+        if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_CODE_SENT, "auth.sentCode");
+        return MTPROTO_OK;
+    }
+    if (ctor == TL_AUTH_AUTHORIZATION) {
+        if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_LOGGED_IN, NULL);
+        return MTPROTO_OK;
+    }
+    if (ctor == 0x44747e9au) {  /* auth.authorizationSignUpRequired */
+        if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_FAILED, "signUpRequired");
+        return MTPROTO_OK;
+    }
+    if (ctor == TL_RPC_ERROR) {
+        { char err[128]; int code = mtproto_tl_parse_rpc_error(p - 4, (size_t)(end - p + 4), err, sizeof(err));
+          if (code == 401 || code == 400) {  /* SESSION_PASSWORD_NEEDED etc */
+            if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_PASSWORD_NEEDED, err);
+          } else {
+            if (session->state->cbs.auth_callback) session->state->cbs.auth_callback(session->state->cbs.userdata, MTP_AUTH_EVENT_FAILED, err);
+          }
+        }
+        return MTPROTO_OK;
+    }
+    /* App-level message: pass through if buffer provided */
+    if (msg_out && msg_size > 0) {
+        size_t copy = (size_t)(end - dec);
+        if (copy > msg_size) copy = msg_size;
+        memcpy(msg_out, dec, copy);
+        return (int)copy;
+    }
     return MTPROTO_OK;
 }
 
