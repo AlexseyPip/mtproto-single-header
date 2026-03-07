@@ -31,7 +31,7 @@ int main(void) {
 
     printf("Echo bot skeleton - poll and reply loop\n");
     for (int i = 0; i < 3; i++) {
-        mtproto_poll(session);
+        mtproto_poll(session, NULL, 0);
     }
 
     mtproto_disconnect(session);
