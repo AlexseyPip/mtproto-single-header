@@ -56,6 +56,9 @@ extern "C" {
 #ifndef MTPROTO_MAX_MSG_HISTORY
 #define MTPROTO_MAX_MSG_HISTORY    256           /* Msg IDs to remember for replay protection */
 #endif
+#ifndef MTPROTO_MAX_PENDING_ACK
+#define MTPROTO_MAX_PENDING_ACK    32            /* Max msg_ids to ack in next send */
+#endif
 #ifndef MTPROTO_PADDING_MIN
 #define MTPROTO_PADDING_MIN        12            /* MTProto 2.0 minimum padding */
 #endif
@@ -1079,6 +1082,9 @@ struct mtproto_session_s {
     int32_t server_time;
     uint8_t p_bytes[8], q_bytes[8];  /* factored pq */
     size_t p_len, q_len;
+    /* msgs_ack: msg_ids we received and should ack with next send */
+    uint64_t recv_msg_ids[MTPROTO_MAX_PENDING_ACK];
+    int      recv_msg_ids_count;
 };
 
 /*--------------------------------------------------------------------------
@@ -1175,8 +1181,9 @@ static int mtp_encrypt_message(mtproto_session_t* s, const uint8_t* tl_data, siz
     return (int)(8 + 16 + total_len);
 }
 
-/* Decrypt MTProto 2.0 message. raw = auth_key_id(8)+msg_key(16)+encrypted. Returns msg_data length, <0 on error. x=8 for server->client. */
-static int mtp_decrypt_message(mtproto_session_t* s, const uint8_t* raw, size_t raw_len, uint8_t* msg_out, size_t msg_size) {
+/* Decrypt MTProto 2.0 message. raw = auth_key_id(8)+msg_key(16)+encrypted. Returns msg_data length, <0 on error.
+ * recv_msg_id_out: optional, receives server msg_id for acks. x=8 for server->client. */
+static int mtp_decrypt_message(mtproto_session_t* s, const uint8_t* raw, size_t raw_len, uint8_t* msg_out, size_t msg_size, int64_t* recv_msg_id_out) {
     uint8_t tmp[4096], verify_buf[4128];
     uint8_t sha256_a[32], sha256_b[32];
     uint8_t aes_key[32], aes_iv[32];
@@ -1206,6 +1213,7 @@ static int mtp_decrypt_message(mtproto_session_t* s, const uint8_t* raw, size_t 
     memcpy(verify_buf + 32, tmp, enc_len);
     mtp_sha256_full(verify_buf, 32 + enc_len, hash_result);
     if (memcmp(msg_key, hash_result + 8, 16) != 0) return MTPROTO_ERR_CRYPTO;
+    if (recv_msg_id_out) memcpy(recv_msg_id_out, tmp + 16, 8);
     memcpy(&msg_data_len, tmp + 24, 4);
     if (msg_data_len < 0 || (size_t)msg_data_len > enc_len - 32) return MTPROTO_ERR_PROTOCOL;
     if ((size_t)msg_data_len > msg_size) return MTPROTO_ERR_BUFFER_TOO_SMALL;
