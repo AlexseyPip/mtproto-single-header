@@ -29,7 +29,7 @@
  * Thread safety: Not thread-safe by default. One mtproto_state_t and its sessions
  * should be used from a single thread unless external synchronization is applied.
  *
- * License: Public domain (CC0)
+ * License: MIT
  * Based on: https://core.telegram.org/mtproto
  */
 
