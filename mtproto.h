@@ -1,4 +1,4 @@
-/* WARNING: This library is not a full-fledged MTProto implementation
+/* WARNING: This library is not a full-fledged MTProto protocol implementation
  * mtproto.h - Single-file header-only C library for MTProto protocol
  * (Telegram messaging protocol)
  *
