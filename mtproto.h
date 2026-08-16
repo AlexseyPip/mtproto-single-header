@@ -1,4 +1,4 @@
-/*
+/* WARNING: IS NOT ALL 
  * mtproto.h - Single-file header-only C library for MTProto protocol
  * (Telegram messaging protocol)
  *
